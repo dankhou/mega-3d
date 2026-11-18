@@ -1,0 +1,280 @@
+# -*- coding: utf-8 -*-
+"""
+Fan RPM Meter Enclosure  -  FreeCAD macro (parametric)
+
+Parts housed:
+  * Arduino Mega 2560 (101.6 x 53.3 mm)  - on 6 standoffs, USB-B + DC jack through the left wall
+  * 1602 LCD + PCF8574 I2C backpack        - screwed under the lid, bezel flush in a window
+  * HW-201 / FC-51 IR sensor               - screwed on a slotted pad, IR LEDs poke out the right wall
+
+HOW TO USE
+  FreeCAD > Macro > Macros... > select this file > Execute
+  Edit the PARAMETERS block below and run again to regenerate.
+  Output (FCStd, STL, STEP) is written to a folder "fan_rpm_enclosure_out" next to this macro.
+
+Coordinate system: origin = inside bottom-left corner of the base cavity.
+  X = length (USB end at X=0, sensor end at X=L), Y = width, Z = up (Z=0 is the floor top).
+All dimensions in mm.
+"""
+
+import os
+import FreeCAD as App
+import Part
+from FreeCAD import Vector as V
+
+# =============================== PARAMETERS ===============================
+WALL   = 2.5     # side wall thickness
+FLOOR  = 2.5     # base floor thickness
+LID_T  = 2.5     # lid plate thickness
+L, W, H = 160.0, 58.0, 52.0   # INSIDE cavity length / width / height
+R_OUT  = 3.0     # outside vertical corner radius
+
+# ---- Arduino Mega 2560 ----
+MEGA_L, MEGA_W, MEGA_T = 101.6, 53.34, 1.6
+MEGA_X = 1.0                       # gap between board edge and left inner wall
+MEGA_Y = (W - MEGA_W) / 2.0
+STANDOFF_H, STANDOFF_D = 5.0, 5.5
+PILOT_M3 = 2.5                     # pilot hole for M3 self-tapping screw (use 4.0 for heat-set inserts)
+MEGA_HOLES = [(13.97, 2.54), (15.24, 50.80), (66.04, 7.62),
+              (66.04, 35.56), (90.17, 50.80), (96.52, 2.54)]   # board coords, origin = corner by DC jack
+USB_YC, USB_CUT_W, USB_CUT_H = 38.10, 13.5, 13.0               # USB-B centre (board Y) and cutout size
+DC_YC,  DC_CUT_W,  DC_CUT_H  = 7.62, 12.0, 14.0                # DC jack centre and cutout (fits plug overmould)
+CUT_Z0 = STANDOFF_H + MEGA_T - 1.0                             # bottom edge of both port cutouts
+
+# ---- HW-201 IR sensor ----
+SEN_L, SEN_W, SEN_T = 31.3, 14.2, 1.6
+SEN_GAP = 0.5                      # gap from PCB LED-end edge to right inner wall
+SEN_BOSS_H = 5.0
+SEN_HOLE_FROM_LED_END = 22.5       # mounting-hole centre measured from the LED end of the PCB
+SEN_SLOT_TRAVEL = 4.0              # slot lets the screw slide +/-2 mm
+SEN_YC = W / 2.0
+LED_Z = SEN_BOSS_H + SEN_T + 2.5   # IR LED axis height
+LED_WIN_W, LED_WIN_H = 17.0, 10.0  # window in right wall for the two IR LEDs
+
+# ---- 1602 LCD (I2C) under the lid ----
+LCD_L, LCD_W, LCD_T = 80.0, 36.0, 1.6
+LCD_HOLE_DX, LCD_HOLE_DY = 75.0, 31.0
+LCD_XC, LCD_YC = L / 2.0, W / 2.0
+LCD_WIN_L, LCD_WIN_W = 72.6, 26.4  # bezel is ~71.2 x 25
+LCD_BOSS_L = 4.5                   # standoff length: puts the 7 mm bezel flush with the lid top
+LCD_BOSS_D, PILOT_M25 = 5.0, 2.1
+
+# ---- lid fastening ----
+CB = 9.0                           # corner boss size (square)
+CB_HANG_Z = 24.0                   # left-end bosses start here (clear of DC jack / USB)
+CB_PILOT_DEPTH = 12.0
+LID_HOLE_D = 3.4
+LIP_H, LIP_T, LIP_CLR = 2.0, 1.3, 0.3
+
+# ---- sensor access slot in lid (trim pot + indicator LEDs) ----
+ACC_X0, ACC_X1, ACC_W = 129.0, 148.0, 10.0
+# ==========================================================================
+
+
+def box(x0, y0, z0, dx, dy, dz):
+    return Part.makeBox(dx, dy, dz, V(x0, y0, z0))
+
+
+def cyl(x, y, z0, d, h):
+    return Part.makeCylinder(d / 2.0, h, V(x, y, z0))
+
+
+def rounded_box(x0, y0, z0, dx, dy, dz, r):
+    b = box(x0, y0, z0, dx, dy, dz)
+    vert = [e for e in b.Edges
+            if abs(e.Vertexes[0].Point.x - e.Vertexes[1].Point.x) < 1e-6
+            and abs(e.Vertexes[0].Point.y - e.Vertexes[1].Point.y) < 1e-6]
+    return b.makeFillet(r, vert)
+
+
+def stadium_x(x0, x1, yc, width, z0, h):
+    """Slot shape running along X from x0 to x1 (centre-to-centre), given width."""
+    r = width / 2.0
+    s = box(x0, yc - r, z0, x1 - x0, width, h)
+    return s.fuse([cyl(x0, yc, z0, width, h), cyl(x1, yc, z0, width, h)]).removeSplitter()
+
+
+def hanging_corner_boss(cx, cy, sx, sy):
+    """Square boss in a corner that starts at CB_HANG_Z, with a 45-deg printable pyramid underneath."""
+    x0 = cx if sx > 0 else cx - CB
+    y0 = cy if sy > 0 else cy - CB
+    column = box(x0, y0, CB_HANG_Z, CB, CB, H - CB_HANG_Z)
+    hgt = 13.0
+    apex = V(cx, cy, CB_HANG_Z - hgt)
+    p = [V(cx, cy, CB_HANG_Z), V(cx + sx * CB, cy, CB_HANG_Z),
+         V(cx + sx * CB, cy + sy * CB, CB_HANG_Z), V(cx, cy + sy * CB, CB_HANG_Z)]
+    faces = [Part.Face(Part.makePolygon(p + [p[0]]))]
+    for i in range(4):
+        faces.append(Part.Face(Part.makePolygon([p[i], p[(i + 1) % 4], apex, p[i]])))
+    pyr = Part.Solid(Part.Shell(faces))
+    if pyr.Volume < 0:
+        pyr.reverse()
+    return column.fuse(pyr).removeSplitter()
+
+
+CORNERS = [(CB / 2, CB / 2), (CB / 2, W - CB / 2), (L - CB / 2, CB / 2), (L - CB / 2, W - CB / 2)]
+
+
+def build_base():
+    shell = rounded_box(-WALL, -WALL, -FLOOR, L + 2 * WALL, W + 2 * WALL, H + FLOOR, R_OUT)
+    shell = shell.cut(box(0, 0, 0, L, W, H + 1))
+
+    adds = []
+    # Mega standoffs
+    for hx, hy in MEGA_HOLES:
+        adds.append(cyl(MEGA_X + hx, MEGA_Y + hy, -0.01, STANDOFF_D, STANDOFF_H + 0.01))
+    # corner bosses for lid screws: right end full height, left end hanging
+    adds.append(box(L - CB, 0, -0.01, CB, CB, H + 0.01))
+    adds.append(box(L - CB, W - CB, -0.01, CB, CB, H + 0.01))
+    adds.append(hanging_corner_boss(0, 0, +1, +1))
+    adds.append(hanging_corner_boss(0, W, +1, -1))
+    # sensor pad (slotted)
+    hx = L - SEN_GAP - SEN_HOLE_FROM_LED_END
+    t2 = SEN_SLOT_TRAVEL / 2.0
+    adds.append(stadium_x(hx - t2, hx + t2, SEN_YC, 9.0, -0.01, SEN_BOSS_H + 0.01))
+    base = shell.fuse(adds).removeSplitter()
+
+    cuts = []
+    for hx_, hy_ in MEGA_HOLES:
+        cuts.append(cyl(MEGA_X + hx_, MEGA_Y + hy_, -1.0, PILOT_M3, STANDOFF_H + 1.1))
+    for cx, cy in CORNERS:
+        cuts.append(cyl(cx, cy, H - CB_PILOT_DEPTH, PILOT_M3, CB_PILOT_DEPTH + 0.1))
+    # USB-B and DC jack cutouts in left wall
+    cuts.append(box(-WALL - 1, MEGA_Y + USB_YC - USB_CUT_W / 2, CUT_Z0, WALL + 1.1, USB_CUT_W, USB_CUT_H))
+    cuts.append(box(-WALL - 1, MEGA_Y + DC_YC - DC_CUT_W / 2, CUT_Z0, WALL + 1.1, DC_CUT_W, DC_CUT_H))
+    # IR LED window in right wall (rounded)
+    win = box(L - 0.1, SEN_YC - LED_WIN_W / 2, LED_Z - LED_WIN_H / 2, WALL + 1.1, LED_WIN_W, LED_WIN_H)
+    xe = [e for e in win.Edges if abs(e.Vertexes[0].Point.x - e.Vertexes[1].Point.x) > 1e-6]
+    cuts.append(win.makeFillet(3.0, xe))
+    # sensor screw slot (through pad and floor) + M3 nut trap from underneath
+    cuts.append(stadium_x(hx - t2, hx + t2, SEN_YC, 3.4, -FLOOR - 1, SEN_BOSS_H + FLOOR + 2))
+    cuts.append(stadium_x(hx - t2 - 0.3, hx + t2 + 0.3, SEN_YC, 5.8, -FLOOR - 1, 1.0 + FLOOR + 1))
+    return base.cut(cuts).removeSplitter()
+
+
+def build_lid():
+    lid = rounded_box(-WALL, -WALL, H, L + 2 * WALL, W + 2 * WALL, LID_T, R_OUT)
+    # locating lip that drops inside the walls
+    lip = box(LIP_CLR, LIP_CLR, H - LIP_H, L - 2 * LIP_CLR, W - 2 * LIP_CLR, LIP_H + 0.01)
+    lip = lip.cut(box(LIP_CLR + LIP_T, LIP_CLR + LIP_T, H - LIP_H - 1,
+                      L - 2 * (LIP_CLR + LIP_T), W - 2 * (LIP_CLR + LIP_T), LIP_H + 2))
+    clr = CB + 0.6
+    for x0, y0 in [(0, 0), (0, W - clr), (L - clr, 0), (L - clr, W - clr)]:
+        lip = lip.cut(box(x0 - 0.5, y0 - 0.5, H - LIP_H - 1, clr + 1.0, clr + 1.0, LIP_H + 2))
+    adds = [lip]
+    # LCD standoffs
+    lcd_holes = [(LCD_XC + sx * LCD_HOLE_DX / 2, LCD_YC + sy * LCD_HOLE_DY / 2)
+                 for sx in (-1, 1) for sy in (-1, 1)]
+    for x, y in lcd_holes:
+        adds.append(cyl(x, y, H - LCD_BOSS_L, LCD_BOSS_D, LCD_BOSS_L + 0.01))
+    lid = lid.fuse(adds).removeSplitter()
+
+    cuts = []
+    for cx, cy in CORNERS:
+        cuts.append(cyl(cx, cy, H - 5, LID_HOLE_D, LID_T + 10))
+    win = box(LCD_XC - LCD_WIN_L / 2, LCD_YC - LCD_WIN_W / 2, H - 1, LCD_WIN_L, LCD_WIN_W, LID_T + 2)
+    ze = [e for e in win.Edges if abs(e.Vertexes[0].Point.z - e.Vertexes[1].Point.z) > 1e-6]
+    cuts.append(win.makeFillet(1.0, ze))
+    for x, y in lcd_holes:
+        cuts.append(cyl(x, y, H - LCD_BOSS_L - 0.1, PILOT_M25, LCD_BOSS_L + 1.0))  # blind, 1.5 mm skin on top
+    cuts.append(stadium_x(ACC_X0 + ACC_W / 2, ACC_X1 - ACC_W / 2, SEN_YC, ACC_W, H - 1, LID_T + 2))
+    return lid.cut(cuts).removeSplitter()
+
+
+# ------------------------- reference (ghost) parts -------------------------
+def ghost_mega():
+    z = STANDOFF_H
+    x0, y0 = MEGA_X, MEGA_Y
+    parts = [box(x0, y0, z, MEGA_L, MEGA_W, MEGA_T)]
+    zt = z + MEGA_T
+    parts.append(box(x0 - 6.35, y0 + USB_YC - 6.0, zt, 16.3, 12.0, 10.9))      # USB-B
+    parts.append(box(x0 - 1.9, y0 + DC_YC - 4.5, zt, 14.4, 9.0, 11.0))          # DC jack
+    parts.append(box(x0 + 17.0, y0 + 49.5, zt, 80.0, 2.6, 8.5))                 # top headers
+    parts.append(box(x0 + 27.0, y0 + 1.3, zt, 70.0, 2.6, 8.5))                  # bottom headers
+    parts.append(box(x0 + 93.5, y0 + 6.0, zt, 5.1, 43.0, 8.5))                  # 2x18 end header
+    parts.append(box(x0 + 3.0, y0 + 14.0, zt, 12.0, 8.0, 10.0))                 # caps / regulator
+    return Part.makeCompound(parts)
+
+
+def ghost_lcd():
+    zf = H - LCD_BOSS_L                     # PCB front face
+    x0, y0 = LCD_XC - LCD_L / 2, LCD_YC - LCD_W / 2
+    parts = [box(x0, y0, zf - LCD_T, LCD_L, LCD_W, LCD_T)]
+    parts.append(box(LCD_XC - 35.6, LCD_YC - 12.6, zf, 71.2, 25.2, 7.0))       # bezel + glass
+    parts.append(box(x0 + 6.0, y0 + LCD_W - 21.0, zf - LCD_T - 12.0, 42.0, 19.0, 12.0))  # I2C backpack
+    parts.append(box(x0 - 6.0, y0 + LCD_W - 15.0, zf - LCD_T - 9.0, 8.0, 10.5, 3.0))     # 4-pin header
+    return Part.makeCompound(parts)
+
+
+def ghost_sensor():
+    x1 = L - SEN_GAP
+    parts = [box(x1 - SEN_L, SEN_YC - SEN_W / 2, SEN_BOSS_H, SEN_L, SEN_W, SEN_T)]
+    for dy in (-3.5, 3.5):
+        c = Part.makeCylinder(2.5, 8.6, V(x1 - 1.0, SEN_YC + dy, LED_Z), V(1, 0, 0))
+        parts.append(c)
+    parts.append(box(x1 - SEN_L - 8.0, SEN_YC - 4.0, SEN_BOSS_H + SEN_T, 8.0, 8.0, 2.5))  # header pins
+    return Part.makeCompound(parts)
+
+
+# ------------------------------- build ------------------------------------
+def main():
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+    except NameError:
+        here = os.path.expanduser("~")
+    out = os.path.join(here, "fan_rpm_enclosure_out")
+    os.makedirs(out, exist_ok=True)
+
+    name = "Fan_RPM_Enclosure"
+    if App.listDocuments().get(name):
+        App.closeDocument(name)
+    doc = App.newDocument(name)
+
+    base_s, lid_s = build_base(), build_lid()
+    base = doc.addObject("Part::Feature", "Base")
+    base.Shape = base_s
+    lid = doc.addObject("Part::Feature", "Lid")
+    lid.Shape = lid_s
+
+    grp = doc.addObject("App::DocumentObjectGroup", "Reference_Parts")
+    ghosts = []
+    for nm, shp in (("Ref_Mega2560", ghost_mega()), ("Ref_LCD1602_I2C", ghost_lcd()),
+                    ("Ref_IR_Sensor", ghost_sensor())):
+        o = doc.addObject("Part::Feature", nm)
+        o.Shape = shp
+        grp.addObject(o)
+        ghosts.append(o)
+
+    # print layout: lid flipped (top face on the bed) beside the base
+    lid_print = doc.addObject("Part::Feature", "Lid_PrintOrientation")
+    s = lid_s.copy()
+    s.rotate(V(0, 0, H), V(1, 0, 0), 180)
+    s.translate(V(0, -(W + 2 * WALL) - 10, -s.BoundBox.ZMin - FLOOR))
+    lid_print.Shape = s
+    lid_print.Visibility = False
+
+    doc.recompute()
+    if App.GuiUp:
+        import FreeCADGui as Gui
+        base.ViewObject.ShapeColor = (0.20, 0.22, 0.25)
+        lid.ViewObject.ShapeColor = (0.30, 0.33, 0.38)
+        lid.ViewObject.Transparency = 40
+        cols = [(0.1, 0.3, 0.8), (0.1, 0.6, 0.3), (0.85, 0.5, 0.1)]
+        for o, c in zip(ghosts, cols):
+            o.ViewObject.ShapeColor = c
+        Gui.SendMsgToActiveView("ViewFit")
+        Gui.activeDocument().activeView().viewIsometric()
+
+    doc.saveAs(os.path.join(out, name + ".FCStd"))
+
+    import MeshPart, Mesh
+    for o, fn in ((base, "base.stl"), (lid_print, "lid.stl")):
+        m = MeshPart.meshFromShape(Shape=o.Shape, LinearDeflection=0.03, AngularDeflection=0.25, Relative=False)
+        m.write(os.path.join(out, fn))
+    base_s.exportStep(os.path.join(out, "base.step"))
+    lid_s.exportStep(os.path.join(out, "lid.step"))
+    App.Console.PrintMessage("Enclosure written to %s\n" % out)
+    return doc
+
+
+main()
